@@ -1,0 +1,481 @@
+<?php
+
+
+
+/**
+ * PHP Error Log GUI
+ *
+ * A clean and effective single-file GUI for viewing entries in the PHP error
+ * log, allowing for filtering by path and by type.
+ *
+ * @author Andrew Collington, andy@amnuts.com
+ * @version 1.0.1
+ * @link https://github.com/amnuts/phperror-gui
+ * @license MIT, http://acollington.mit-license.org/
+ */
+
+/**
+ * @var string|null Path to error log file or null to get from ini settings
+ */
+$error_log = null;
+// $error_log = $_SERVER['DOCUMENT_ROOT'] . 'admin/storage/logs/error_log.txt';
+/**
+ * @var string|null Path to log cache - must be writable - null for no cache
+ */
+$cache = null;
+/**
+ * @var array Array of log lines
+ */
+$logs = [];
+/**
+ * @var array Array of log types
+ */
+$types = [];
+
+
+if ($error_log === null) {
+    $error_log = ini_get('error_log');
+}
+
+if(isset($_REQUEST['remove']) && $_REQUEST['remove']){
+    file_put_contents($error_log, '');
+    header('location: https://www.wellnesstrade.cz/admin/error_log');
+}
+
+ini_set('display_errors', 1);
+ini_set('display_startup_errors', 1);
+error_reporting(E_ALL);
+/**
+ * https://gist.github.com/amnuts/8633684
+ */
+function osort(&$array, $properties)
+{
+    if (is_string($properties)) {
+        $properties = array($properties => SORT_ASC);
+    }
+    uasort($array, function ($a, $b) use ($properties) {
+        foreach ($properties as $k => $v) {
+            if (is_int($k)) {
+                $k = $v;
+                $v = SORT_ASC;
+            }
+            $collapse = function ($node, $props) {
+                if (is_array($props)) {
+                    foreach ($props as $prop) {
+                        $node = (!isset($node->$prop)) ? null : $node->$prop;
+                    }
+                    return $node;
+                } else {
+                    return (!isset($node->$props)) ? null : $node->$props;
+                }
+            };
+            $aProp = $collapse($a, $k);
+            $bProp = $collapse($b, $k);
+            if ($aProp != $bProp) {
+                return ($v == SORT_ASC)
+                ? strnatcasecmp($aProp, $bProp)
+                : strnatcasecmp($bProp, $aProp);
+            }
+        }
+        return 0;
+    });
+}
+
+
+
+if (empty($error_log)) {
+    die('No error log was defined or could be determined from the ini settings.');
+}
+
+try {
+    $log = new SplFileObject($error_log);
+    $log->setFlags(SplFileObject::DROP_NEW_LINE);
+} catch (RuntimeException $e) {
+    die("The file '{$error_log}' cannot be opened for reading.\n");
+}
+
+if ($cache !== null && file_exists($cache)) {
+    $cacheData = unserialize(file_get_contents($cache));
+    extract($cacheData);
+    $log->fseek($seek);
+}
+
+$prevError = new stdClass;
+while (!$log->eof()) {
+    if (preg_match('/stack trace:$/i', $log->current())) {
+        $stackTrace = $parts = [];
+        $log->next();
+        while ((preg_match('!^\[(?P<time>[^\]]*)\] PHP\s+(?P<msg>\d+\. .*)$!', $log->current(), $parts)
+            || preg_match('!^(?P<msg>#\d+ .*)$!', $log->current(), $parts)
+            && !$log->eof())
+        ) {
+            $stackTrace[] = $parts['msg'];
+            $log->next();
+        }
+        if (substr($stackTrace[0], 0, 2) == '#0') {
+            $stackTrace[] = $log->current();
+            $log->next();
+        }
+        $prevError->trace = join("\n", $stackTrace);
+    }
+
+    $more = [];
+    while (!preg_match('!^\[(?P<time>[^\]]*)\] ((PHP|ojs2: )(?P<typea>.*?):|(?P<typeb>(WordPress|ojs2|\w has produced)\s{1,}\w+ \w+))\s+(?P<msg>.*)$!', $log->current()) && !$log->eof()) {
+        $more[] = $log->current();
+        $log->next();
+    }
+    if (!empty($more)) {
+        $prevError->more = join("\n", $more);
+    }
+
+    $parts = [];
+    if (preg_match('!^\[(?P<time>[^\]]*)\] ((PHP|ojs2: )(?P<typea>.*?):|(?P<typeb>(WordPress|ojs2|\w has produced)\s{1,}\w+ \w+))\s+(?P<msg>.*)$!', $log->current(), $parts)) {
+        $parts['type'] = (@$parts['typea'] ?: $parts['typeb']);
+        if ($parts[3] == 'ojs2: ' || $parts[6] == 'ojs2') {
+            $parts['type'] = 'ojs2 application';
+        }
+        $msg = trim($parts['msg']);
+        $type = strtolower(trim($parts['type']));
+        $types[$type] = strtolower(preg_replace('/[^a-z]/i', '', $type));
+        if (!isset($logs[$msg])) {
+            $data = [
+                'type' => $type,
+                'first' => date_timestamp_get(date_create($parts['time'])),
+                'last' => date_timestamp_get(date_create($parts['time'])),
+                'msg' => $msg,
+                'hits' => 1,
+                'trace' => null,
+                'more' => null,
+            ];
+            $subparts = [];
+            if (preg_match('!(?<core> in (?P<path>(/|zend)[^ :]*)(?: on line |:)(?P<line>\d+))$!', $msg, $subparts)) {
+                $data['path'] = $subparts['path'];
+                $data['line'] = $subparts['line'];
+                $data['core'] = str_replace($subparts['core'], '', $data['msg']);
+                $data['code'] = '';
+                try {
+                    $file = new SplFileObject(str_replace('zend.view://', '', $subparts['path']));
+                    $file->seek(PHP_INT_MAX);
+                    $i = 7;
+                    do {
+                        $data['code'] .= $file->current();
+                        $file->next();
+                    } while (--$i && !$file->eof());
+                } catch (Exception $e) {
+                }
+            }
+            $logs[$msg] = (object) $data;
+            if (!isset($typecount[$type])) {
+                $typecount[$type] = 1;
+            } else {
+                ++$typecount[$type];
+            }
+        } else {
+            ++$logs[$msg]->hits;
+            $time = date_timestamp_get(date_create($parts['time']));
+            if ($time < $logs[$msg]->first) {
+                $logs[$msg]->first = $time;
+            }
+            if ($time > $logs[$msg]->last) {
+                $logs[$msg]->last = $time;
+            }
+        }
+        $prevError = &$logs[$msg];
+    }
+    $log->next();
+}
+
+if ($cache !== null) {
+    $cacheData = serialize(['seek' => $log->getSize(), 'logs' => $logs, 'types' => $types, 'typecount' => $typecount]);
+    file_put_contents($cache, $cacheData);
+}
+
+$log = null;
+
+osort($logs, ['last' => SORT_DESC]);
+$total = count($logs);
+ksort($types);
+
+$host = (function_exists('gethostname')
+    ? gethostname()
+    : (php_uname('n')
+        ?: (empty($_SERVER['SERVER_NAME'])
+            ? $_SERVER['HOST_NAME']
+            : $_SERVER['SERVER_NAME']
+        )
+    )
+);
+
+?><!doctype html>
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="cleartype" content="on">
+    <meta name="HandheldFriendly" content="True">
+    <meta name="MobileOptimized" content="320">
+    <meta name="generator" content="https://github.com/amnuts/phperror-gui" />
+    <title>PHP error log on <?= htmlentities($host) ?></title>
+    <script src="//code.jquery.com/jquery-2.2.1.min.js" type="text/javascript"></script>
+    <style type="text/css">
+        body { font-family: Arial, Helvetica, sans-serif; font-size: 80%; margin: 0; padding: 0; }
+        article { width: 100%; display: block; margin: 0 0 1em 0; background-color: #fcfcfc; }
+        article > div { border: 1px solid #000000; border-left-width: 10px; padding: 1em; }
+        article > div > b { font-weight: bold; display: block; }
+        article > div > i { display: block; }
+        article > div > blockquote {
+            display: none;
+            background-color: #ededed;
+            border: 1px solid #ababab;
+            padding: 1em;
+            overflow: auto;
+            margin: 0;
+        }
+        footer { border-top: 1px solid #ccc; padding: 1em 2em; }
+        footer a {
+            padding: 2em;
+            text-decoration: none;
+            opacity: 0.7;
+            background-position: 5px 50%;
+            background-repeat: no-repeat;
+            background-color: transparent;
+            background-position: 0 50%;
+            background-image: url('data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABIAAAAQCAYAAAAbBi9cAAAAGXRFWHRTb2Z0d2FyZQBBZG9iZSBJbWFnZVJlYWR5ccllPAAAAyBpVFh0WE1MOmNvbS5hZG9iZS54bXAAAAAAADw/eHBhY2tldCBiZWdpbj0i77u/IiBpZD0iVzVNME1wQ2VoaUh6cmVTek5UY3prYzlkIj8+IDx4OnhtcG1ldGEgeG1sbnM6eD0iYWRvYmU6bnM6bWV0YS8iIHg6eG1wdGs9IkFkb2JlIFhNUCBDb3JlIDUuMC1jMDYwIDYxLjEzNDc3NywgMjAxMC8wMi8xMi0xNzozMjowMCAgICAgICAgIj4gPHJkZjpSREYgeG1sbnM6cmRmPSJodHRwOi8vd3d3LnczLm9yZy8xOTk5LzAyLzIyLXJkZi1zeW50YXgtbnMjIj4gPHJkZjpEZXNjcmlwdGlvbiByZGY6YWJvdXQ9IiIgeG1sbnM6eG1wPSJodHRwOi8vbnMuYWRvYmUuY29tL3hhcC8xLjAvIiB4bWxuczp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIgeG1sbnM6c3RSZWY9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZVJlZiMiIHhtcDpDcmVhdG9yVG9vbD0iQWRvYmUgUGhvdG9zaG9wIENTNSBXaW5kb3dzIiB4bXBNTTpJbnN0YW5jZUlEPSJ4bXAuaWlkOjE2MENCRkExNzVBQjExRTQ5NDBGRTUzMzQyMDVDNzFFIiB4bXBNTTpEb2N1bWVudElEPSJ4bXAuZGlkOjE2MENCRkEyNzVBQjExRTQ5NDBGRTUzMzQyMDVDNzFFIj4gPHhtcE1NOkRlcml2ZWRGcm9tIHN0UmVmOmluc3RhbmNlSUQ9InhtcC5paWQ6MTYwQ0JGOUY3NUFCMTFFNDk0MEZFNTMzNDIwNUM3MUUiIHN0UmVmOmRvY3VtZW50SUQ9InhtcC5kaWQ6MTYwQ0JGQTA3NUFCMTFFNDk0MEZFNTMzNDIwNUM3MUUiLz4gPC9yZGY6RGVzY3JpcHRpb24+IDwvcmRmOlJERj4gPC94OnhtcG1ldGE+IDw/eHBhY2tldCBlbmQ9InIiPz7HtUU1AAABN0lEQVR42qyUvWoCQRSF77hCLLKC+FOlCKTyIbYQUuhbWPkSFnZ2NpabUvANLGyz5CkkYGMlFtFAUmiSM8lZOVkWsgm58K079+fMnTusZl92BXbgDrTtZ2szd8fas/XBOzmBKaiCEFyTkL4pc9L8vgpNJJDyWtDna61EoXpO+xcFfXUVqtrf7Vx7m9Pub/EatvgHoYXD4ylztC14BBVwydvydgDPHPgNaErN3jLKIxAUmEvAXK21I18SJpXBGAxyBAaMlblOWOs1bMXFkMGeBFsi0pJNe/QNuV7563+gs8LfhrRfE6GaHLuRqfnUiKi6lJ034B44EXL0baTTJWujNGkG3kBX5uRyZuRkPl3WzDTBtzjnxxiDDq83yNxUk7GYuXM53jeLuMNavvAXkv4zrJkTaeGHAAMAIal3icPMsyQAAAAASUVORK5CYII=');
+            font-size: 90%;
+        }
+        footer a:hover { opacity: 1; }
+        #container { padding: 2em; }
+        #typeFilter, #pathFilter, #sortOptions { border: 0; margin: 0; padding: 0; }
+        #typeFilter > p { line-height: 2.2em; }
+        #pathFilter input { width: 30em; }
+        #typeFilter label { border-bottom: 4px solid #000000; margin-right: 1em; padding-bottom: 2px; }
+        .hide { display: none; }
+        .alternate { background-color: #f8f8f8; }
+        .deprecated { border-color: #acacac !important; }
+        .notice { border-color: #6dcff6 !important; }
+        .warning { border-color: #fbaf5d !important; }
+        .fatalerror { border-color: #f26c4f !important; }
+        .strictstandards { border-color: #534741 !important; }
+        .catchablefatalerror { border-color: #f68e56 !important; }
+        .parseerror { border-color: #aa66cc !important; }
+    </style>
+</head>
+<body>
+
+<div id="container">
+<?php if (!empty($logs)): ?>
+
+    <p id="serverDetails">Error log '<?= htmlentities($error_log) ?>' on <?php
+echo htmlentities($host); ?> (PHP <?= phpversion() ?>, <?= htmlentities($_SERVER['SERVER_SOFTWARE']) ?>) ~ <a href="?remove=true">Empty the log</a></p>
+
+    <fieldset id="typeFilter">
+        <p>Filter by type:
+            <?php foreach ($types as $title => $class): ?>
+            <label class="<?= $class ?>">
+                <input type="checkbox" value="<?= $class ?>" checked="checked" /> <?php
+echo $title; ?> (<span data-total="<?= $typecount[$title] ?>"><?php
+echo $typecount[$title]; ?></span>)
+            </label>
+            <?php endforeach;?>
+        </p>
+    </fieldset>
+
+    <fieldset id="pathFilter">
+        <p><label>Filter by path: <input type="text" value="" placeholder="Just start typing..." /></label></p>
+    </fieldset>
+
+    <fieldset id="sortOptions">
+        <p>Sort by: <a href="?type=last&amp;order=asc">last seen (<span>asc</span>)</a>, <a href="?type=hits&amp;order=desc">hits (<span>desc</span>)</a>, <a href="?type=type&amp;order=asc">type (<span>a-z</span>)</a></p>
+    </fieldset>
+
+    <p id="entryCount"><?= $total ?> distinct entr<?= ($total == 1 ? 'y' : 'ies') ?></p>
+
+    <section id="errorList">
+    <?php foreach ($logs as $log): ?>
+        <article class="<?= $types[$log->type] ?>"
+                data-path="<?php if (!empty($log->path)) {
+    echo htmlentities($log->path);
+}
+?>"
+                data-line="<?php if (!empty($log->line)) {
+    echo $log->line;
+}
+?>"
+                data-type="<?= $types[$log->type] ?>"
+                data-hits="<?= $log->hits ?>"
+                data-last="<?= $log->last ?>">
+            <div class="<?= $types[$log->type] ?>">
+                <i><?= htmlentities($log->type) ?></i> <b><?= htmlentities((empty($log->core) ? $log->msg : $log->core)) ?></b><br />
+                <?php if (!empty($log->more)): ?>
+                	<p><i><?= nl2br(htmlentities($log->more)) ?></i></p>
+                <?php endif;?>
+                <p>
+                    <?php if (!empty($log->path)): ?>
+                        <?= htmlentities($log->path) ?>, line <?= $log->line ?><br />
+                    <?php endif;?>
+                    last seen <?= date_format(date_create("@{$log->last}"), 'Y-m-d G:ia') ?>, <?= $log->hits ?> hit<?= ($log->hits == 1 ? '' : 's') ?><br />
+                </p>
+                <?php if (!empty($log->trace)): ?>
+                    <?php $uid = uniqid('tbq');?>
+                    <p><a href="#" class="traceblock" data-for="<?= $uid ?>">Show stack trace</a></p>
+                    <blockquote id="<?= $uid ?>"><?= highlight_string($log->trace, true) ?></blockquote>
+                <?php endif;?>
+                <?php if (!empty($log->code)): ?>
+                    <?php $uid = uniqid('cbq');?>
+                    <p><a href="#" class="codeblock" data-for="<?= $uid ?>">Show code snippet</a></p>
+                    <blockquote id="<?= $uid ?>"><?= highlight_string($log->code, true) ?></blockquote>
+                <?php endif;?>
+            </div>
+        </article>
+    <?php endforeach;?>
+    </section>
+
+    <p id="nothingToShow" class="hide">Nothing to show with your selected filtering.</p>
+<?php else: ?>
+    <p>There are currently no PHP error log entries available.</p>
+<?php endif;?>
+</div>
+
+<footer>
+    <a href="https://github.com/amnuts/phperror-gui" target="_blank">https://github.com/amnuts/phperror-gui</a>
+</footer>
+
+<script type="text/javascript">
+    var debounce = function(func, wait, immediate) {
+        var timeout;
+        wait = wait || 250;
+        return function() {
+            var context = this, args = arguments;
+            var later = function() {
+                timeout = null;
+                if (!immediate) {
+                    func.apply(context, args);
+                }
+            };
+            var callNow = immediate && !timeout;
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+            if (callNow) {
+                func.apply(context, args);
+            }
+        };
+    };
+
+    function parseQueryString(qs) {
+        var query = (qs || '?').substr(1), map = {};
+        query.replace(/([^&=]+)=?([^&]*)(?:&+|$)/g, function(match, key, value) {
+            (map[key] = map[key] || value);
+        });
+        return map;
+    }
+
+    function stripe() {
+        var errors = $('#errorList').find('article');
+        errors.removeClass('alternate');
+        errors.filter(':not(.hide):odd').addClass('alternate');
+    }
+
+    function visible() {
+        var vis = $('#errorList').find('article').filter(':not(.hide)');
+        var len = vis.length;
+        if (len == 0) {
+            $('#nothingToShow').removeClass('hide');
+            $('#entryCount').text('0 entries showing (<?= $total ?> filtered out)');
+        } else {
+            $('#nothingToShow').addClass('hide');
+            if (len == <?= $total ?>) {
+                $('#entryCount').text('<?= $total ?> distinct entr<?= ($total == 1 ? 'y' : 'ies') ?>');
+            } else {
+                $('#entryCount').text(len + ' distinct entr' + (len == 1 ? 'y' : 'ies') + ' showing ('
+                    + (<?= $total ?> - len) + ' filtered out)');
+            }
+        }
+        $('#typeFilter').find('label span').each(function(){
+            var count = ($('#pathFilter').find('input').val() == ''
+                ? $(this).data('total')
+                : $(this).data('current') + '/' + $(this).data('total')
+            );
+            $(this).text(count);
+        });
+        stripe();
+    }
+
+    function filterSet() {
+        var typeCount = {};
+        var checked = $('#typeFilter').find('input:checkbox:checked').map(function(){
+            return $(this).val();
+        }).get();
+        var input = $('#pathFilter').find('input').val();
+        $('article').each(function(){
+            var a = $(this);
+            var found = a.data('path').toLowerCase().indexOf(input.toLowerCase());
+            if ((input.length && found == -1) || (jQuery.inArray(a.data('type'), checked) == -1)) {
+                a.addClass('hide');
+            } else {
+                a.removeClass('hide');
+            }
+            if (found != -1) {
+                if (typeCount.hasOwnProperty(a.data('type'))) {
+                    ++typeCount[a.data('type')];
+                } else {
+                    typeCount[a.data('type')] = 1;
+                }
+            }
+        });
+        $('#typeFilter').find('label').each(function(){
+            var type = $(this).attr('class');
+            if (typeCount.hasOwnProperty(type)) {
+                $('span', $(this)).data('current', typeCount[type]);
+            } else {
+                $('span', $(this)).data('current', 0);
+            }
+        });
+    }
+
+    function sortEntries(type, order) {
+        var aList = $('#errorList').find('article');
+        aList.sort(function(a, b){
+            if (!isNaN($(a).data(type))) {
+                var entryA = parseInt($(a).data(type));
+                var entryB = parseInt($(b).data(type));
+            } else {
+                var entryA = $(a).data(type);
+                var entryB = $(b).data(type);
+            }
+            if (order == 'asc') {
+                return (entryA < entryB) ? -1 : (entryA > entryB) ? 1 : 0;
+            }
+            return  (entryB < entryA) ? -1 : (entryB > entryA) ? 1 : 0;
+        });
+        $('section').html(aList);
+    }
+
+    $(function(){
+        $('#typeFilter').find('input:checkbox').on('change', function(){
+            filterSet();
+            visible();
+        });
+        $('#pathFilter').find('input').on('keyup', debounce(function(){
+            filterSet();
+            visible();
+        }));
+        $('#sortOptions').find('a').on('click', function(){
+            var qs = parseQueryString($(this).attr('href'));
+            sortEntries(qs.type, qs.order);
+            $(this).attr('href', '?type=' + qs.type + '&order=' + (qs.order == 'asc' ? 'desc' : 'asc'));
+            if (qs.type == 'type') {
+                $('span', $(this)).text((qs.order == 'asc' ? 'z-a' : 'a-z'));
+            } else {
+                $('span', $(this)).text((qs.order == 'asc' ? 'desc' : 'asc'));
+            }
+            return false;
+        });
+        $(document).on('click', 'a.codeblock, a.traceblock', function(e){
+            $('#' + $(this).data('for')).toggle();
+            return false;
+        });
+        stripe();
+    });
+</script>
+
+</body>
+</html>

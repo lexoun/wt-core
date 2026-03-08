@@ -1,0 +1,55 @@
+/* -------- parametry – posledních 30 dní -------- */
+DECLARE @today     date = CAST(GETDATE() AS date);
+DECLARE @date_from date = DATEADD(day, -30, @today);
+
+/* -------- 1) zdrojová data -------- */
+;WITH src AS (
+    SELECT
+        DropDate = CAST(Dropped AS date),                 -- osa X (den)
+        DiffMin  = DATEDIFF(minute, Dropped, PickedUp)    -- rozdíl v minutách
+    FROM dbo.Shipments
+    WHERE Dropped >= @date_from
+      AND Dropped <  @today
+      AND PickedUp IS NOT NULL
+      AND State = '112'
+      AND DropOffRole = 'Driver'
+)
+ /* -------- 2) zařazení do hodinových bucketů -------- */
+, bucketed AS (
+    SELECT
+        DropDate,
+        BucketHour = CASE
+                       WHEN CEILING(DiffMin / 60.0) > 24 THEN 25  -- 25 = „24 h+“
+                       ELSE CEILING(DiffMin / 60.0)               -- 1,2,…,24
+                     END
+    FROM src
+)
+/* -------- 3) převod na textový štítek pro pivot -------- */
+, labelled AS (
+    SELECT
+        DropDate,
+        BucketLabel = CASE
+                        WHEN BucketHour = 25 THEN '24 h+'
+                        ELSE CONCAT(BucketHour, ' h')
+                      END
+    FROM bucketed
+)
+/* -------- 4) pivot do 24 sloupců (1 h … 24 h+) -------- */
+SELECT
+    DropDate,                            -- datum (osa X)
+    [1 h],  [2 h],  [3 h],  [4 h],  [5 h],  [6 h],  [7 h],  [8 h],
+    [9 h], [10 h], [11 h], [12 h], [13 h], [14 h], [15 h], [16 h],
+   [17 h], [18 h], [19 h], [20 h], [21 h], [22 h], [23 h], [24 h+]
+FROM (
+    SELECT DropDate, BucketLabel
+    FROM labelled
+) AS d
+PIVOT (
+    COUNT(BucketLabel)                     -- kolik zásilek v daném bucketu
+    FOR BucketLabel IN (
+        [1 h],[2 h],[3 h],[4 h],[5 h],[6 h],[7 h],[8 h],
+        [9 h],[10 h],[11 h],[12 h],[13 h],[14 h],[15 h],[16 h],
+        [17 h],[18 h],[19 h],[20 h],[21 h],[22 h],[23 h],[24 h+]
+    )
+) AS p
+ORDER BY DropDate desc;
